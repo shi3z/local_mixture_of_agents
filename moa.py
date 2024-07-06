@@ -1,5 +1,5 @@
 """
-Local Mixture of Agents  
+Japanese Mixture of Agents  
 
 based on https://github.com/togethercomputer/MoA/tree/main
 
@@ -16,12 +16,16 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.prompt import Prompt
 import copy
+import multiprocessing as mp
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 models=[
     ["lightblue/karasu-7B",5001],
     ["karakuri-ai/karakuri-lm-8x7b-chat-v0.1",5002],
     ["elyza/Llama-3-ELYZA-JP-8B",5004]
 ]
+
 
 llm=""
 
@@ -106,8 +110,7 @@ def loadHugeLLM(session_len=1048576,tp=4):
 
 
 def inject_references_to_messages(
-    messages,
-    references,
+    messages,references
 ):
 
     messages = copy.deepcopy(messages)
@@ -115,7 +118,8 @@ def inject_references_to_messages(
     system = f"""最新のユーザー クエリに対するさまざまなオープンソース モデルからの一連の応答が提供されています。あなたの仕事は、これらの応答を 1 つの高品質な応答に合成することです。これらの回答で提供された情報には偏りや不正確なものがある可能性があることを認識し、批判的に評価することが重要です。回答は、与えられた回答を単に再現するだけでなく、指示に対する洗練された正確かつ包括的な回答を提供する必要があります。応答が適切に構成され、一貫性があり、最高の精度と信頼性の基準に準拠していることを確認してください。
 
 モデルからの応答:"""
-
+    print("^^^^^^^")
+    print(references)
     for i, reference in enumerate(references):
 
         system += f"\n{i+1}. {reference}"
@@ -134,15 +138,14 @@ def inject_references_to_messages(
 def generate_with_references(
     model,
     messages,
-    references=[],
+    references,
     max_tokens=2048,
     temperature=0.7,
     llm=generate_vllm
     ):
 
     if len(references) > 0:
-
-        messages = inject_references_to_messages(messages, references)
+        messages = inject_references_to_messages(messages,references)
 
     return llm(
         model=model,
@@ -156,14 +159,13 @@ def process_fn(
     temperature=0.7,
     max_tokens=2048,
 ):
-    references = item.get("references", [])
     model = item["model"]
     messages = item["instruction"]
 
     output = generate_with_references(
         model=model,
         messages=messages,
-        references=references,
+        references=item["references"],
         temperature=temperature,
         max_tokens=max_tokens,
         llm=generate_vllm
@@ -172,6 +174,17 @@ def process_fn(
 
     return {"output": output}
 console = Console()
+
+def convert_dict_to_list(data):
+    result = []
+    for i in range(len(data["model"])):
+        item = {
+            "instruction": data["instruction"][i],
+            "references": data["references"][i],
+            "model": data["model"][i]
+        }
+        result.append(item)
+    return result
 
 def main(temperature=0.7,rounds=3,max_tokens=2048):
     global llm
@@ -187,32 +200,36 @@ def main(temperature=0.7,rounds=3,max_tokens=2048):
         "model": [m for m in models],
     }
 
-    print(data)
     for i in range(len(models)):
         data["instruction"][i].append({"role": "user", "content": instruction})
         data["references"] = [""] * len(models)
-    print(data)
-    #eval_set = datasets.Dataset.from_dict(data)
     num_proc=len(models)
 
+    ctx = mp.get_context('spawn')
 
+
+    refs= [""] * len(models)
     for i_round in range(rounds):
-        references = data["references"]
+        with ctx.Pool(processes=num_proc) as pool:
+            # 非同期にタスクを実行
+            results = pool.map_async(process_fn, convert_dict_to_list(data))
+            final_results = results.get()
+        
         for i in range(num_proc):
-            output = process_fn({"model":data["model"][i],
-                                "references":data["references"][i],
-                                "instruction":data["instruction"][i]})
-            references[i] = output["output"]
-        data["references"] = references
-        print(data)
+           refs[i]  = final_results[i]["output"]
+        
+        for i in range(num_proc):
+            data["references"][i]=refs
     
+    messages=[{"role":"system","content":"あなたはイカしたアシスタントです"},
+                {"role":"user","content":instruction}] 
 
     output = generate_with_references(
         model=model,
         messages=messages,
-        references=references,
+        references=refs,
         temperature=temperature,
-        max_tokens=8192,
+        max_tokens=1024*10,
         llm=generate_llm
     )
     print(output)
